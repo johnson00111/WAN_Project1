@@ -111,9 +111,46 @@ typedef struct dummy_params {
     int give_up_ms;          /* sender:   total silence -> quit */
 } params;
 
-/*                      W    fb  nack  sess  ling   to  retx  busy  give_up */
-#define PARAMS_LAN {  256,    2,    1, 10000, 2000,  20,    1, 1000, 10000 }
-#define PARAMS_WAN { 1500,   10,    1, 10000, 2000, 100,   40, 1000, 10000 }
+/* The four that affect throughput can be overridden at compile time so a tuning
+ * sweep never has to edit this file and put it back:
+ *
+ *   make clean && make CFLAGS="-c -Wall -pedantic -g -DW_LAN=512"
+ *
+ * The values below are the submitted ones. The remaining five are timeouts for
+ * failure handling, not performance knobs, so they stay fixed. */
+#ifndef W_LAN
+#define W_LAN 256
+#endif
+#ifndef W_WAN
+#define W_WAN 1500
+#endif
+#ifndef FB_PERIOD_LAN
+#define FB_PERIOD_LAN 2
+#endif
+#ifndef FB_PERIOD_WAN
+#define FB_PERIOD_WAN 10
+#endif
+#ifndef TIMEOUT_LAN
+#define TIMEOUT_LAN 20
+#endif
+#ifndef TIMEOUT_WAN
+#define TIMEOUT_WAN 100
+#endif
+/* Measured, not derived: 1 ms was chosen on the theory that the LAN RTT is
+ * below timer resolution, but what a repair actually waits on is the queue,
+ * not propagation. A 256-packet window at 100 Mbps drains in ~29 ms, so at 1 ms
+ * every hole was resent dozens of times before its repair could arrive. 10 ms
+ * measured fastest across every loss rate; see stages/stage6. */
+#ifndef RETX_SUPPRESS_LAN
+#define RETX_SUPPRESS_LAN 10
+#endif
+#ifndef RETX_SUPPRESS_WAN
+#define RETX_SUPPRESS_WAN 40
+#endif
+
+/*                        W          fb  nack  sess  ling        to           retx  busy  give_up */
+#define PARAMS_LAN { W_LAN, FB_PERIOD_LAN,  1, 10000, 2000, TIMEOUT_LAN, RETX_SUPPRESS_LAN, 1000, 10000 }
+#define PARAMS_WAN { W_WAN, FB_PERIOD_WAN,  1, 10000, 2000, TIMEOUT_WAN, RETX_SUPPRESS_WAN, 1000, 10000 }
 
 /* Also the one choke point every window value passes through, so the W_MAX
  * check lives here rather than at each call site. */
