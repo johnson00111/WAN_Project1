@@ -198,6 +198,7 @@ static void Handle_packet(const ncp_msg *m, int len, const struct sockaddr_in *f
     }
 
     Last_data_ms = now_ms();
+    stats_add(&Stats, 0, (uint64_t)len);            /* wire cost only */
 
     if (m->hdr.seq == 0) {
         Send_feedback();                 /* duplicate metadata, just re-ack */
@@ -322,7 +323,7 @@ static void Advance_aru(void) {
             exit(1);
         }
         Bytes_written += Slot_len[idx];
-        stats_add(&Stats, Slot_len[idx], Slot_len[idx]);
+        stats_add(&Stats, Slot_len[idx], 0);        /* in-order payload */
         Have[idx] = 0;
         Aru++;
     }
