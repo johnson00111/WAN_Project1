@@ -28,6 +28,7 @@ static void Map_source(void);
 static void Send_seq0(void);
 static void Send_data(uint32_t seq);
 static void Fill_window(void);
+static void Send_retransmissions(const rcv_msg *m);
 static void Finish(void);
 static void Handle_reply(const rcv_msg *m, int len);
 static const char *State_name(int s);
@@ -57,6 +58,9 @@ static uint32_t    Aru;              /* highest in-order sequence the receiver c
 static uint32_t    Next_new;         /* next sequence never sent */
 static uint64_t    Bytes_raw;        /* everything put on the wire, headers included */
 static uint32_t    Last_probe_ms;    /* rate limit on the timeout safety net */
+static uint32_t    Last_progress_ms; /* when aru last moved */
+static uint32_t   *Last_tx_ms;       /* per sequence, for retransmission suppression */
+static uint64_t    Retx_count;
 
 int main(int argc, char *argv[]) {
 
@@ -144,11 +148,20 @@ int main(int argc, char *argv[]) {
             exit(1);
         }
 
-        /* The safety net: nothing from the receiver for a whole poll interval.
-         * TIMEOUT is 10x FB_PERIOD, so while feedback flows this never fires
-         * and retransmission is left to the receiver's NACKs. */
-        if (now_ms() - Last_rx_ms < (uint32_t)poll_ms ||
-            now_ms() - Last_probe_ms < (uint32_t)poll_ms) {
+        /* The safety net fires on either kind of stall.
+         *
+         * Silence means feedback itself is being lost. No progress means the
+         * receiver is talking but aru has not moved, and the usual cause is a
+         * hole the bitmap cannot express: it only spans (aru, high_seq], so
+         * sequences lost above everything the receiver has seen -- the tail of
+         * the file, in practice -- are invisible to it. Probing aru+1 is what
+         * walks the transfer through them. */
+        if (now_ms() - Last_probe_ms < (uint32_t)poll_ms) {
+            continue;
+        }
+        if (now_ms() - Last_rx_ms < (uint32_t)poll_ms &&
+            !(State == ST_TRANSFERRING &&
+              now_ms() - Last_progress_ms >= (uint32_t)poll_ms)) {
             continue;
         }
         Last_probe_ms = now_ms();
@@ -169,6 +182,9 @@ int main(int argc, char *argv[]) {
         case ST_TRANSFERRING:
             /* Only aru + 1 moves the left edge, so poke at that and refill
              * whatever the window still allows. */
+            if (Aru + 1 < Next_new) {
+                Retx_count++;            /* already sent once, so this is a resend */
+            }
             Send_data(Aru + 1);
             Fill_window();
             break;
@@ -201,6 +217,7 @@ static void Send_seq0(void) {
 
     sendto_dbg(Sock, (const char *)&m, HDR_LEN + body, 0,
                (struct sockaddr *)&Dest, sizeof(Dest));
+    Last_tx_ms[0] = now_ms();
     Bytes_raw += HDR_LEN + body;
 }
 
@@ -222,6 +239,7 @@ static void Handle_reply(const rcv_msg *m, int len) {
             stats_start(&Stats, "ncp", File_size);
             State = ST_TRANSFERRING;
             Next_new = 1;
+            Last_progress_ms = now_ms();
             printf("[ncp] %s, %" PRIu32 " packets to send\n", State_name(State), N);
         }
 
@@ -232,6 +250,7 @@ static void Handle_reply(const rcv_msg *m, int len) {
                 acked = File_size - (uint64_t)Aru * PAYLOAD;   /* last one is short */
             }
             Aru = m->hdr.seq;
+            Last_progress_ms = now_ms();
             stats_add(&Stats, acked, 0);
         }
 
@@ -239,7 +258,7 @@ static void Handle_reply(const rcv_msg *m, int len) {
             Finish();
         }
 
-        /* TODO stage 4: rebuild retx[] from the bitmap and send those first. */
+        Send_retransmissions(m);
         Fill_window();
         break;
 
@@ -284,6 +303,12 @@ static void Map_source(void) {
     File_size = (uint64_t)st.st_size;
     N = (uint32_t)((File_size + PAYLOAD - 1) / PAYLOAD);   /* 0 for an empty file */
 
+    Last_tx_ms = calloc((size_t)N + 1, sizeof(*Last_tx_ms));
+    if (Last_tx_ms == NULL) {
+        fprintf(stderr, "ncp: out of memory for %" PRIu32 " timestamps\n", N + 1);
+        exit(1);
+    }
+
     if (File_size == 0) {
         /* mmap() of a zero-length file fails with EINVAL, and there is nothing
          * to map anyway -- seq 0 alone completes the transfer. */
@@ -325,7 +350,47 @@ static void Send_data(uint32_t seq) {
 
     sendto_dbg(Sock, (const char *)&m, HDR_LEN + body, 0,
                (struct sockaddr *)&Dest, sizeof(Dest));
+    Last_tx_ms[seq] = now_ms();
     Bytes_raw += HDR_LEN + body;
+}
+
+/* Every sequence the bitmap reports as missing, oldest first, subject to
+ * RETX_SUPPRESS. A receiver reports the same hole in every feedback until it is
+ * filled, so without the suppression one lost packet would be resent dozens of
+ * times per RTT. With it, a sequence goes out at most once per RETX_SUPPRESS
+ * however often it is named -- which is what makes it safe for the receiver to
+ * report eagerly.
+ *
+ * Retransmissions go before new data, always: only filling aru+1 moves the
+ * left edge, so serving new data first would deadlock the window. */
+static void Send_retransmissions(const rcv_msg *m) {
+    const unsigned char *bitmap = (const unsigned char *)m->payload;
+    uint32_t             nbits  = m->hdr.extra;
+    uint32_t             now    = now_ms();
+    uint32_t             i;
+
+    if (nbits > (uint32_t)m->hdr.body_len * 8) {
+        nbits = (uint32_t)m->hdr.body_len * 8;   /* trust the bytes that arrived */
+    }
+    if (nbits > BITMAP_MAX_BITS) {
+        nbits = BITMAP_MAX_BITS;
+    }
+
+    for (i = 0; i < nbits; i++) {
+        uint32_t seq = Aru + 1 + i;
+
+        if (seq > N) {
+            break;
+        }
+        if (bitmap[i / 8] & (1u << (i % 8))) {
+            continue;                    /* already arrived */
+        }
+        if (now - Last_tx_ms[seq] < (uint32_t)Params->retx_suppress_ms) {
+            continue;                    /* resent too recently to have landed */
+        }
+        Send_data(seq);
+        Retx_count++;
+    }
 }
 
 /* The window is [aru+1, aru+W] and nothing outside it is ever transmitted. */
@@ -341,7 +406,8 @@ static void Fill_window(void) {
 static void Finish(void) {
     stats_final(&Stats);
     printf("[ncp] done: aru == N == %" PRIu32 ", %" PRIu64 " bytes acked, "
-           "%" PRIu64 " bytes on the wire\n", N, File_size, Bytes_raw);
+           "%" PRIu64 " bytes on the wire, %" PRIu64 " retransmissions\n",
+           N, File_size, Bytes_raw, Retx_count);
     exit(0);
 }
 

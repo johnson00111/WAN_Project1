@@ -9,6 +9,12 @@
 /t_ncp
 /t_rcv
 
-# Generated test files
+# Test data: the folder is tracked, nothing inside it is.
+# Generated inputs and received outputs both live here, so a transfer never
+# leaves anything loose in the repo.
+/testdata/*
+!/testdata/.gitkeep
+
+# Second line of defence, for files generated at the repo root by mistake
 test*MB.txt
 test*MB.bin

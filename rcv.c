@@ -43,7 +43,9 @@ static struct sockaddr_in Cur_addr;
 static uint32_t           Aru;
 static uint32_t           N;
 static uint32_t           Last_data_ms;
+static uint32_t           High_seq;      /* highest sequence seen this session */
 static uint32_t           Last_fb_ms;
+static uint32_t           Last_nack_ms;
 static uint32_t           Linger_start_ms;
 static stats_t            Stats;
 
@@ -202,11 +204,28 @@ static void Handle_packet(const ncp_msg *m, int len, const struct sockaddr_in *f
         return;
     }
 
+    if (m->hdr.seq <= Aru) {
+        /* Already written. Still worth answering: a duplicate means the sender
+         * has not seen how far we got. */
+        Send_feedback();
+        return;
+    }
+
     Store_packet(m);
     Advance_aru();
 
     if (Aru >= N) {
         Complete_session();
+        return;
+    }
+
+    /* A hole is worth reporting straight away rather than waiting up to
+     * FB_PERIOD -- repair latency turns directly into lost throughput. The
+     * NACK_MIN floor keeps that from becoming a feedback flood, and the sender
+     * suppresses duplicate retransmissions anyway. */
+    if (High_seq > Aru && now_ms() - Last_nack_ms >= (uint32_t)Params->nack_min_ms) {
+        Last_nack_ms = now_ms();
+        Send_feedback();
     }
 }
 
@@ -230,6 +249,8 @@ static void Adopt_session(const ncp_msg *m, const struct sockaddr_in *from) {
     Cur_session  = m->hdr.session_id;
     Cur_addr     = *from;
     Aru          = 0;
+    High_seq     = 0;
+    Last_nack_ms = 0;
     Last_data_ms = now_ms();
     Bytes_written = 0;
     Done_valid   = 0;
@@ -280,6 +301,10 @@ static void Store_packet(const ncp_msg *m) {
     memcpy(Slot[idx], m->payload, m->hdr.body_len);
     Slot_len[idx] = m->hdr.body_len;
     Have[idx]     = 1;
+
+    if (seq > High_seq) {
+        High_seq = seq;
+    }
 }
 
 /* Bytes only reach the file once every gap below them is filled, so the file
@@ -329,17 +354,41 @@ static void Abort_session(void) {
     State = ST_IDLE;
 }
 
+/* FEEDBACK is one message carrying both halves of the answer: aru is the left
+ * edge, and the bitmap above it names the exact holes. Bit i means aru+1+i has
+ * arrived, so bit 0 is always 0 -- aru+1 is missing by definition, otherwise
+ * aru would have moved past it. With nothing out of order the bitmap is empty
+ * and this is a plain 16-byte cumulative ACK. */
 static void Send_feedback(void) {
-    rcv_msg m;
+    rcv_msg        m;
+    unsigned char *bitmap;
+    uint32_t       nbits = 0;
+    uint32_t       i;
+    int            nbytes;
 
     memset(&m, 0, sizeof(m));
+    bitmap = (unsigned char *)m.payload;
+
+    if (High_seq > Aru) {
+        nbits = High_seq - Aru;
+        if (nbits > BITMAP_MAX_BITS) {
+            nbits = BITMAP_MAX_BITS;     /* cannot happen while W < W_MAX */
+        }
+        for (i = 0; i < nbits; i++) {
+            if (Have[(Aru + 1 + i) % W_MAX]) {
+                bitmap[i / 8] |= (unsigned char)(1u << (i % 8));
+            }
+        }
+    }
+    nbytes = (int)((nbits + 7) / 8);
+
     m.hdr.type       = MSG_FEEDBACK;
     m.hdr.session_id = Cur_session;
     m.hdr.seq        = Aru;
-    m.hdr.extra      = 0;                /* no gaps to report yet */
-    m.hdr.body_len   = 0;
+    m.hdr.extra      = nbits;
+    m.hdr.body_len   = (uint16_t)nbytes;
 
-    sendto_dbg(Sock, (const char *)&m, HDR_LEN, 0,
+    sendto_dbg(Sock, (const char *)&m, HDR_LEN + nbytes, 0,
                (struct sockaddr *)&Cur_addr, sizeof(Cur_addr));
     Last_fb_ms = now_ms();
 }
