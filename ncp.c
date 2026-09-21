@@ -32,6 +32,7 @@ static void Send_retransmissions(const rcv_msg *m);
 static void Finish(void);
 static void Handle_reply(const rcv_msg *m, int len);
 static const char *State_name(int s);
+static uint32_t Make_session_id(void);
 
 /* Global configuration parameters (from command line) */
 static int Loss_rate;
@@ -95,8 +96,7 @@ int main(int argc, char *argv[]) {
     Map_source();
     Init_socket();
 
-    /* Random enough to tell one transfer from another. */
-    Session_id = (uint32_t)(now_ms() ^ (getpid() << 16));
+    Session_id = Make_session_id();
 
     printf("\tFile size = %" PRIu64 " bytes, N = %" PRIu32 " packets, session_id = %" PRIu32 "\n",
            File_size, N, Session_id);
@@ -352,6 +352,7 @@ static void Send_data(uint32_t seq) {
                (struct sockaddr *)&Dest, sizeof(Dest));
     Last_tx_ms[seq] = now_ms();
     Bytes_raw += HDR_LEN + body;
+    stats_add(&Stats, 0, (uint64_t)(HDR_LEN + body));   /* wire cost only */
 }
 
 /* Every sequence the bitmap reports as missing, oldest first, subject to
@@ -434,6 +435,21 @@ static void Init_socket(void) {
     }
     memcpy(&Dest, res->ai_addr, res->ai_addrlen);
     freeaddrinfo(res);
+}
+
+/* The receiver keeps answering a completed session_id so that a sender whose
+ * final ACK was lost is never stranded. A fresh transfer that collided with
+ * one of those would be told "already done" and would exit having sent
+ * nothing, so this wants real spread rather than a couple of low bits of clock.
+ *
+ * srand() here is harmless to the loss emulator: sendto_dbg() seeds itself on
+ * its first call, which happens after this. */
+static uint32_t Make_session_id(void) {
+    struct timeval t;
+
+    gettimeofday(&t, NULL);
+    srand((unsigned)(t.tv_sec ^ t.tv_usec ^ (getpid() << 8)));
+    return ((uint32_t)rand() << 17) ^ ((uint32_t)rand() << 1) ^ (uint32_t)getpid();
 }
 
 static const char *State_name(int s) {
