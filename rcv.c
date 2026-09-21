@@ -15,6 +15,7 @@
  */
 #define ST_IDLE      1
 #define ST_RECEIVING 2
+#define ST_LINGER    3
 
 static void Usage(int argc, char *argv[]);
 static void Print_help(void);
@@ -23,6 +24,10 @@ static void Handle_packet(const ncp_msg *m, int len, const struct sockaddr_in *f
 static void Adopt_session(const ncp_msg *m, const struct sockaddr_in *from);
 static void Send_feedback(void);
 static void Send_busy(uint32_t session, const struct sockaddr_in *to);
+static void Store_packet(const ncp_msg *m);
+static void Advance_aru(void);
+static void Complete_session(void);
+static void Abort_session(void);
 
 /* Global configuration parameters (from command line) */
 static int Loss_rate;
@@ -38,7 +43,22 @@ static struct sockaddr_in Cur_addr;
 static uint32_t           Aru;
 static uint32_t           N;
 static uint32_t           Last_data_ms;
+static uint32_t           Last_fb_ms;
+static uint32_t           Linger_start_ms;
 static stats_t            Stats;
+
+/* Reorder ring. Indexed seq % W_MAX -- see the W_MAX comment in net_include.h
+ * for why the window has to stay below it. 4096 * 1384 = 5.7 MB, fixed, so
+ * tuning W never means resizing anything. */
+static char     Slot[W_MAX][PAYLOAD];
+static uint16_t Slot_len[W_MAX];
+static char     Have[W_MAX];
+
+static FILE     *Fp;
+static char      Dst_name[PAYLOAD];
+static uint64_t  Bytes_written;
+static int       Done_valid;         /* Cur_session finished; keep answering it */
+static int       Stray_reported;     /* one line per idle spell, not per packet */
 
 int main(int argc, char *argv[]) {
     /* Line-buffered: progress has to show up promptly when stdout is a pipe
@@ -97,32 +117,42 @@ int main(int argc, char *argv[]) {
 
             got = recvfrom(Sock, &m, sizeof(m), 0,
                            (struct sockaddr *)&from, &from_len);
-            if (got < (ssize_t)HDR_LEN) {
-                continue;               /* too short to be ours */
+            if (got >= (ssize_t)HDR_LEN) {
+                Handle_packet(&m, (int)got, &from);
             }
-            Handle_packet(&m, (int)got, &from);
-            continue;
         }
 
-        /* Poll expiry. A sender that dies mid-transfer must not pin the
-         * receiver forever. Deleting the partial file belongs here too, once
-         * there is a file. */
-        if (State == ST_RECEIVING &&
-            now_ms() - Last_data_ms > (uint32_t)Params->session_timeout_ms) {
-            printf("[rcv] session %" PRIu32 " silent for %d ms, back to IDLE\n",
-                   Cur_session, Params->session_timeout_ms);
-            State = ST_IDLE;
+        /* Timers are checked every iteration, not just when select() times
+         * out: while data is pouring in select() always returns ready and the
+         * timeout branch would never run. */
+        if (State == ST_RECEIVING) {
+            if (now_ms() - Last_fb_ms >= (uint32_t)Params->fb_period_ms) {
+                Send_feedback();
+            }
+            /* A sender that dies mid-transfer must not pin the receiver. */
+            if (now_ms() - Last_data_ms > (uint32_t)Params->session_timeout_ms) {
+                Abort_session();
+            }
+        } else if (State == ST_LINGER) {
+            if (now_ms() - Linger_start_ms > (uint32_t)Params->linger_ms) {
+                State = ST_IDLE;
+                Stray_reported = 0;
+                printf("[rcv] LINGER over, IDLE\n");
+            }
         }
-
-        /* TODO: periodic FEEDBACK every FB_PERIOD once a transfer is running. */
     }
 }
 
 static void Handle_packet(const ncp_msg *m, int len, const struct sockaddr_in *from) {
-    printf("[rcv] from %s:%d  type=%" PRIu8 " seq=%" PRIu32 " extra=%" PRIu32
-           " body_len=%" PRIu16 " (%d B)\n",
-           inet_ntoa(from->sin_addr), ntohs(from->sin_port),
-           m->hdr.type, m->hdr.seq, m->hdr.extra, m->hdr.body_len, len);
+    /* Deliberately not one line per packet: a 100 MB transfer is 72,255 of
+     * them, and the printing alone would dominate the measurement. Only the
+     * events worth seeing get a line. */
+    if (m->hdr.seq == 0) {
+        printf("[rcv] from %s:%d  type=%" PRIu8 " seq=%" PRIu32 " extra=%" PRIu32
+               " body_len=%" PRIu16 " (%d B)\n",
+               inet_ntoa(from->sin_addr), ntohs(from->sin_port),
+               m->hdr.type, m->hdr.seq, m->hdr.extra, m->hdr.body_len, len);
+    }
 
     if (m->hdr.type != MSG_DATA) {
         return;                          /* receivers never see FEEDBACK or BUSY */
@@ -136,18 +166,29 @@ static void Handle_packet(const ncp_msg *m, int len, const struct sockaddr_in *f
         return;
     }
 
+    /* A sender whose final ACK was lost keeps asking. Answering it costs one
+     * packet and saves it from hanging; this is what LINGER is for, and it
+     * outlives LINGER so the sender is never stranded. */
+    if (Done_valid && m->hdr.session_id == Cur_session) {
+        Send_feedback();
+        return;
+    }
+
     if (State == ST_IDLE) {
         if (m->hdr.seq != 0) {
             /* Only seq 0 carries the filename, so nothing else is usable here.
-             * Almost always a leftover from an abandoned transfer. */
-            printf("[rcv]   ignored: IDLE and seq != 0\n");
+             * Almost always a leftover from an abandoned transfer, and it
+             * arrives in floods, so say it once per idle spell. */
+            if (!Stray_reported) {
+                printf("[rcv]   ignoring stray data: IDLE, and only seq 0 is usable\n");
+                Stray_reported = 1;
+            }
             return;
         }
         Adopt_session(m, from);
         return;
     }
 
-    /* RECEIVING */
     if (m->hdr.session_id != Cur_session) {
         printf("[rcv]   busy: session %" PRIu32 " is in progress\n", Cur_session);
         Send_busy(m->hdr.session_id, from);
@@ -157,13 +198,16 @@ static void Handle_packet(const ncp_msg *m, int len, const struct sockaddr_in *f
     Last_data_ms = now_ms();
 
     if (m->hdr.seq == 0) {
-        printf("[rcv]   duplicate seq 0, re-acking\n");
-    } else {
-        /* TODO stage 3: buffer at slot[seq % W_MAX], walk aru forward, write
-         * out whatever just became contiguous. */
-        printf("[rcv]   data seq %" PRIu32 " (not buffered yet)\n", m->hdr.seq);
+        Send_feedback();                 /* duplicate metadata, just re-ack */
+        return;
     }
-    Send_feedback();
+
+    Store_packet(m);
+    Advance_aru();
+
+    if (Aru >= N) {
+        Complete_session();
+    }
 }
 
 static void Adopt_session(const ncp_msg *m, const struct sockaddr_in *from) {
@@ -187,16 +231,102 @@ static void Adopt_session(const ncp_msg *m, const struct sockaddr_in *from) {
     Cur_addr     = *from;
     Aru          = 0;
     Last_data_ms = now_ms();
+    Bytes_written = 0;
+    Done_valid   = 0;
     State        = ST_RECEIVING;
+
+    Stray_reported = 0;
+    memset(Have, 0, sizeof(Have));
+    strcpy(Dst_name, name);
+
+    Fp = fopen(Dst_name, "wb");
+    if (Fp == NULL) {
+        fprintf(stderr, "rcv: cannot open %s for writing: %s\n",
+                Dst_name, strerror(errno));
+        State = ST_IDLE;
+        return;
+    }
 
     stats_start(&Stats, "rcv", file_size);
 
     printf("[rcv]   adopted session %" PRIu32 ": \"%s\", %" PRIu64 " bytes, N = %" PRIu32 "\n",
-           Cur_session, name, file_size, N);
+           Cur_session, Dst_name, file_size, N);
     printf("[rcv]   RECEIVING\n");
 
-    /* TODO stage 3: open the file here. */
+    if (N == 0) {
+        Complete_session();              /* empty file: seq 0 is the whole thing */
+        return;
+    }
     Send_feedback();
+}
+
+/* Out-of-order packets wait in the ring until the gap below them is filled. */
+static void Store_packet(const ncp_msg *m) {
+    uint32_t seq = m->hdr.seq;
+    int      idx;
+
+    if (seq <= Aru || seq > N) {
+        return;                          /* already written, or past the end */
+    }
+    if (seq - Aru >= W_MAX) {
+        /* Beyond what the ring can hold without aliasing. Cannot happen while
+         * W < W_MAX, but dropping it is the only safe answer if it ever does. */
+        printf("[rcv]   dropped seq %" PRIu32 ": %" PRIu32 " past aru, ring holds %d\n",
+               seq, seq - Aru, W_MAX);
+        return;
+    }
+
+    idx = seq % W_MAX;
+    memcpy(Slot[idx], m->payload, m->hdr.body_len);
+    Slot_len[idx] = m->hdr.body_len;
+    Have[idx]     = 1;
+}
+
+/* Bytes only reach the file once every gap below them is filled, so the file
+ * is always a correct prefix and Bytes_written is exactly the "received in
+ * order" number the report asks for. */
+static void Advance_aru(void) {
+    while (Aru < N) {
+        int idx = (int)((Aru + 1) % W_MAX);
+
+        if (!Have[idx]) {
+            break;
+        }
+        if (fwrite(Slot[idx], 1, Slot_len[idx], Fp) != Slot_len[idx]) {
+            fprintf(stderr, "rcv: write to %s failed: %s\n", Dst_name, strerror(errno));
+            exit(1);
+        }
+        Bytes_written += Slot_len[idx];
+        stats_add(&Stats, Slot_len[idx], Slot_len[idx]);
+        Have[idx] = 0;
+        Aru++;
+    }
+}
+
+static void Complete_session(void) {
+    stats_final(&Stats);
+    fclose(Fp);
+    Fp = NULL;
+
+    printf("[rcv] done: %" PRIu64 " bytes written to \"%s\"\n", Bytes_written, Dst_name);
+
+    Done_valid      = 1;
+    State           = ST_LINGER;
+    Linger_start_ms = now_ms();
+    Send_feedback();                     /* final ACK, aru == N */
+}
+
+/* A truncated file is worse than no file: it looks valid while being corrupt. */
+static void Abort_session(void) {
+    printf("[rcv] session %" PRIu32 " silent for %d ms, discarding \"%s\"\n",
+           Cur_session, Params->session_timeout_ms, Dst_name);
+    if (Fp != NULL) {
+        fclose(Fp);
+        Fp = NULL;
+    }
+    remove(Dst_name);
+    Stray_reported = 0;
+    State = ST_IDLE;
 }
 
 static void Send_feedback(void) {
@@ -211,6 +341,7 @@ static void Send_feedback(void) {
 
     sendto_dbg(Sock, (const char *)&m, HDR_LEN, 0,
                (struct sockaddr *)&Cur_addr, sizeof(Cur_addr));
+    Last_fb_ms = now_ms();
 }
 
 static void Send_busy(uint32_t session, const struct sockaddr_in *to) {
