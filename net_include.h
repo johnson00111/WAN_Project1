@@ -76,6 +76,25 @@ _Static_assert(sizeof(rcv_msg) == MAX_MESS_LEN, "rcv_msg over the datagram budge
 
 #define BITMAP_MAX_BITS (PAYLOAD * 8)   /* 11072. Clamp to it; don't trust high_seq. */
 
+/* ms clock for every timer. Wraps every ~49 days; only differences matter. */
+static inline uint32_t now_ms(void)
+{
+    struct timeval t;
+
+    gettimeofday(&t, NULL);
+    return (uint32_t)(t.tv_sec * 1000 + t.tv_usec / 1000);
+}
+
+/* select() timeout from a ms value. */
+static inline struct timeval ms_to_tv(int ms)
+{
+    struct timeval t;
+
+    t.tv_sec  = ms / 1000;
+    t.tv_usec = (ms % 1000) * 1000;
+    return t;
+}
+
 /* One set per environment, picked by the LAN/WAN argument, so reproducing
  * either set of results needs no code change. Derivation is in the design
  * doc; short version: WAN BDP is 361 packets and W starts around 4x that.
