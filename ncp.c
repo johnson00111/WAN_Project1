@@ -16,6 +16,7 @@ static char *Port_Str;
 static char *Src_filename;
 static char *Dst_filename;
 static char *Hostname;
+static const params *Params;
 
 int main(int argc, char *argv[]) {
 
@@ -33,6 +34,17 @@ int main(int argc, char *argv[]) {
     } else { /*(Mode == WAN)*/
         printf("\tMode = WAN\n");
     }
+
+    /* Also enforces W < W_MAX -- see net_include.h. */
+    Params = params_for(Mode);
+    printf("\tWire format: header %d B + payload %d B = datagram %d B\n",
+           (int)sizeof(pkt_hdr), PAYLOAD, (int)sizeof(ncp_msg));
+    printf("\tSender params: W = %d pkt, TIMEOUT = %d ms, RETX_SUPPRESS = %d ms,\n"
+           "\t               BUSY_RETRY = %d ms, GIVE_UP_SILENCE = %d ms\n",
+           Params->W, Params->timeout_ms, Params->retx_suppress_ms,
+           Params->busy_retry_ms, Params->give_up_ms);
+
+    return 0;
 }
 
 /* Read commandline arguments */

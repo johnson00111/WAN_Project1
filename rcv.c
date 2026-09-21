@@ -12,6 +12,7 @@ static void Print_help(void);
 static int Loss_rate;
 static int Mode;
 static char *Port_Str;
+static const params *Params;
 
 int main(int argc, char *argv[]) {
     /* Initialize */
@@ -25,6 +26,19 @@ int main(int argc, char *argv[]) {
     } else { /*(Mode == WAN)*/
         printf("\tMode = WAN\n");
     }
+
+    /* Also enforces W < W_MAX -- see net_include.h. */
+    Params = params_for(Mode);
+    printf("\tWire format: header %d B + payload %d B = datagram %d B\n",
+           (int)sizeof(pkt_hdr), PAYLOAD, (int)sizeof(rcv_msg));
+    printf("\tRing buffer: W_MAX = %d slots (%.1f MB), bitmap capacity = %d bits\n",
+           W_MAX, (double)W_MAX * PAYLOAD / 1000000.0, BITMAP_MAX_BITS);
+    printf("\tReceiver params: FB_PERIOD = %d ms, NACK_MIN = %d ms,\n"
+           "\t                 SESSION_TIMEOUT = %d ms, LINGER_TIME = %d ms\n",
+           Params->fb_period_ms, Params->nack_min_ms,
+           Params->session_timeout_ms, Params->linger_ms);
+
+    return 0;
 }
 
 /* Read commandline arguments */
