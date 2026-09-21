@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Build artifacts
+*.o
+/ncp
+/rcv
+/t_ncp
+/t_rcv
+
+# Generated test files
+test*MB.txt
+test*MB.bin

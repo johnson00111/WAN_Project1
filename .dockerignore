@@ -1,0 +1,8 @@
+.git
+.gitignore
+*.md
+*.o
+ncp
+rcv
+t_ncp
+t_rcv
