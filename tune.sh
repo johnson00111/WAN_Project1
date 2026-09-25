@@ -10,8 +10,10 @@
 #
 #   EXTRA="-DRETX_SUPPRESS_LAN=10" ./tune.sh LAN rcv 10 W_LAN 64 128 256
 #
-# Rebuilds ncp for each value, runs one 100 MB transfer, and pulls the rate out
-# of the [FINAL] line. Only sender-side parameters can be swept this way --
+# Rebuilds ncp for each value, runs one 100 MB transfer, and pulls the numbers
+# out of the "Transfer Complete" block stats_final() prints, plus the exact
+# wire byte count from ncp's closing "[ncp] done:" line. Only sender-side
+# parameters can be swept this way --
 # FB_PERIOD lives in the receiver, so that one needs the same treatment on the
 # other container.
 #
@@ -43,14 +45,14 @@ for VALUE in "$@"; do
         # The receiver refuses a new session while it LINGERs over the previous
         # one, so give it room rather than racing it.
         sleep 3
-        LINE=$(./ncp "$LOSS" "$MODE" "$SRC" "$DST@$HOST:5000" | grep '^\[FINAL\]' || true)
-        if [ -z "$LINE" ]; then
-            echo "$MODE,$LOSS,$VALUE,$R,FAILED,,," 
+        OUT=$(./ncp "$LOSS" "$MODE" "$SRC" "$DST@$HOST:5000" || true)
+        SECS=$(echo "$OUT" | sed -n 's/^Transfer time: \([0-9.]*\) seconds.*/\1/p')
+        if [ -z "$SECS" ]; then
+            echo "$MODE,$LOSS,$VALUE,$R,FAILED,,,"
         else
-            MBPS=$(echo "$LINE" | sed 's/.*avg_mbps=\([0-9.]*\).*/\1/')
-            SECS=$(echo "$LINE" | sed 's/.*elapsed_s=\([0-9.]*\).*/\1/')
-            RAW=$(echo "$LINE" | sed 's/.*raw=\([0-9]*\).*/\1/')
-            OVER=$(echo "$LINE" | sed 's/.*overhead=\([0-9.]*\).*/\1/')
+            MBPS=$(echo "$OUT" | sed -n 's/^Average transfer rate: \([0-9.]*\) Mbps.*/\1/p')
+            RAW=$(echo "$OUT" | sed -n 's/.* \([0-9]*\) bytes on the wire.*/\1/p')
+            OVER=$(echo "$OUT" | sed -n 's/^Bandwidth overhead ratio: \([0-9.]*\).*/\1/p')
             echo "$MODE,$LOSS,$VALUE,$R,$MBPS,$SECS,$RAW,$OVER"
         fi
         R=$((R + 1))
